@@ -62,6 +62,7 @@ rules takes about 200 ms on an unrestricted laptop CPU and about 1 second with
 | --- | --- | --- |
 | `NLI_HOST` | `0.0.0.0` in the image | Listen address |
 | `NLI_PORT` | `8080` | Listen port |
+| `NLI_MODEL_NAME` | `deberta-v3-large-zeroshot-v2.0-c@b2730f1` | Name the server answers to and reports, for example a versioned alias of your own; change it whenever the model or image changes |
 | `NLI_API_KEY` | unset | When set, requests need `Authorization: Bearer <key>` |
 | `NLI_THREADS` | container CPU limit | PyTorch threads |
 | `NLI_QUEUE_TIMEOUT_SECONDS` | `10` | How long a request waits for the model before a 503 |

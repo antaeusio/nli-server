@@ -7,6 +7,7 @@ from http.server import ThreadingHTTPServer
 
 from nli_server.server import (
     MAX_PREMISE_CHARS,
+    MODEL_NAME_PATTERN,
     InstructionsTooLong,
     RequestError,
     Service,
@@ -44,10 +45,11 @@ def request(questions=None, **overrides):
 
 class ServerTest(unittest.TestCase):
     api_key = None
+    served_name = MODEL
 
     def setUp(self):
         self.scorer = FakeScorer()
-        self.service = Service(self.scorer, MODEL, self.api_key)
+        self.service = Service(self.scorer, self.served_name, self.api_key)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.service))
         self.server.RequestHandlerClass.log_message = lambda *args: None
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -177,6 +179,22 @@ class AuthTest(ServerTest):
                 self.assertEqual((status, payload["error"]["code"]), (401, "unauthorized"))
         status, _ = self.post(request(), {"Authorization": "Bearer s3cret"})
         self.assertEqual(status, 200)
+
+
+class AliasTest(ServerTest):
+    served_name = "antaeus-semantic-v1"
+
+    def test_answers_and_reports_only_the_served_name(self):
+        status, payload = self.post(request(model="antaeus-semantic-v1"))
+        self.assertEqual((status, payload["model"]), (200, "antaeus-semantic-v1"))
+        status, payload = self.post(request(model="deberta-v3-large-zeroshot-v2.0-c@b2730f1"))
+        self.assertEqual((status, payload["error"]["code"]), (404, "model_not_found"))
+
+    def test_name_pattern_matches_the_client(self):
+        for name in ("antaeus-semantic-v1", "deberta-v3-large-zeroshot-v2.0-c@b2730f1"):
+            self.assertTrue(MODEL_NAME_PATTERN.fullmatch(name))
+        for name in ("", "-x", "has space", "x" * 257):
+            self.assertFalse(MODEL_NAME_PATTERN.fullmatch(name))
 
 
 class RenderTest(unittest.TestCase):
