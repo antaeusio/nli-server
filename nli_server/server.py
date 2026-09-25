@@ -9,6 +9,7 @@ import hmac
 import json
 import math
 import os
+import re
 import signal
 import sys
 import threading
@@ -27,6 +28,8 @@ MAX_PREMISE_CHARS = 16384
 MAX_KEY_CHARS = 256
 # How long a request waits for the model before the server reports it busy.
 QUEUE_TIMEOUT_SECONDS = float(os.environ.get("NLI_QUEUE_TIMEOUT_SECONDS", "10"))
+# The model names the Antaeus System One client accepts.
+MODEL_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}")
 METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 PATHS = {"/healthz", "/v1/systemone"}
 
@@ -246,9 +249,13 @@ def cpu_quota():
 def main():
     from nli_server.model import MODEL_NAME, NLIScorer
 
+    # Check configuration before the slow model load.
+    model_name = os.environ.get("NLI_MODEL_NAME") or MODEL_NAME
+    if not MODEL_NAME_PATTERN.fullmatch(model_name):
+        sys.exit("NLI_MODEL_NAME must be 1 to 256 letters, digits, or ._:/@+- and start with a letter or digit")
     threads = int(os.environ.get("NLI_THREADS", "0")) or cpu_quota()
     scorer = NLIScorer(os.environ.get("NLI_MODEL_DIR", "/opt/model"), threads)
-    service = Service(scorer, MODEL_NAME, os.environ.get("NLI_API_KEY") or None)
+    service = Service(scorer, model_name, os.environ.get("NLI_API_KEY") or None)
     host = os.environ.get("NLI_HOST", "127.0.0.1")
     port = int(os.environ.get("NLI_PORT", "8080"))
     server = ThreadingHTTPServer((host, port), make_handler(service))
@@ -259,7 +266,7 @@ def main():
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    sys.stderr.write(f"serving {MODEL_NAME} on {host}:{port} with {threads} threads\n")
+    sys.stderr.write(f"serving {model_name} on {host}:{port} with {threads} threads\n")
     server.serve_forever()
     server.server_close()
 
