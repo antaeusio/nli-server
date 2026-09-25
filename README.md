@@ -48,6 +48,10 @@ with the Hugging Face libraries offline.
 
 ## Run it
 
+Released images are published for linux/amd64 as
+`ghcr.io/antaeusio/nli-server:vX.Y.Z`, with build-provenance attestations.
+Pin the digest shown in the release run. To build locally instead:
+
 ```sh
 scripts/build-image antaeus-nli-server:dev
 docker run --rm -p 127.0.0.1:8080:8080 antaeus-nli-server:dev
@@ -96,6 +100,22 @@ the input:
 
 The server logs the method, a known path, and the status, never bodies,
 headers, or keys. It stops cleanly on SIGTERM.
+
+## Releasing
+
+Push a `vX.Y.Z` tag on a commit on `main`. The
+[release workflow](.github/workflows/release.yml) runs the unit tests, builds
+the linux/amd64 image, and pushes it by digest. It then smoke-tests the pushed
+image (non-root user, health, one authenticated answer, a rejected
+unauthenticated request), attests it, and only then tags it with the version. It refuses to republish a
+version that already exists.
+
+The first publish creates the GHCR package as private; an organization owner
+makes it public once. To verify an image before use:
+
+```sh
+gh attestation verify oci://ghcr.io/antaeusio/nli-server@sha256:<digest> --repo antaeusio/nli-server
+```
 
 ## Development
 

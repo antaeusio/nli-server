@@ -12,6 +12,12 @@ RUN python -c "import sys; from huggingface_hub import snapshot_download; snapsh
  && test "$(ls | wc -l)" -eq "$(wc -l < /tmp/model.sha256)"
 
 FROM ${PYTHON_IMAGE}
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.source="https://github.com/antaeusio/nli-server" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.licenses="Apache-2.0 AND MIT"
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HOME=/tmp/hf \
     NLI_MODEL_DIR=/opt/model NLI_HOST=0.0.0.0 NLI_PORT=8080
