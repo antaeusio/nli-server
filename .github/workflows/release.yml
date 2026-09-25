@@ -1,0 +1,147 @@
+name: Release image
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    name: Validate ${{ github.ref_name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Require a vX.Y.Z tag
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require the tagged commit to be on main
+        run: |
+          git fetch --no-tags --depth=200 origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Unit tests
+        run: scripts/test -v
+
+  publish:
+    name: Build, smoke-test, attest, and tag ${{ github.ref_name }}
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # The build is not bit-reproducible, so a re-run must never move a
+      # published version to a new digest.
+      - name: Refuse to republish an existing version
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo "$IMAGE:$VERSION already exists; delete the tag deliberately before re-releasing" >&2
+            exit 1
+          fi
+      - name: Free disk space for the model image
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Record the commit time for reproducible image metadata
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      # Push by digest only. The version tag is added after the smoke test and
+      # attestation succeed. Consumers pin the digest.
+      - name: Build and push the linux/amd64 image by digest
+        id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          provenance: false
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+      - name: Smoke-test the published image
+        shell: bash
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          trap 'docker logs smoke 2>&1 | tail -50 || true' ERR
+          docker pull "$IMAGE@$DIGEST"
+          test "$(docker image inspect "$IMAGE@$DIGEST" --format '{{.Config.User}}')" = '65532:65532'
+          docker run -d --name smoke -e NLI_MODEL_NAME=smoke-alias -e NLI_API_KEY=smoke-key \
+            -p 127.0.0.1:8080:8080 "$IMAGE@$DIGEST"
+          for _ in $(seq 1 300); do
+            curl -sf localhost:8080/healthz >/dev/null && break
+            test "$(docker inspect -f '{{.State.Running}}' smoke)" = true
+            sleep 1
+          done
+          curl -sf localhost:8080/healthz | grep -F '"model":"smoke-alias"'
+          test "$(docker exec smoke id -u)" = 65532
+          body='{"state":{"title":"Hunting rifle"},"model":"smoke-alias","questions":{"weapon":{"type":"noul","instructions":"The listing offers a weapon."}}}'
+          answer=$(curl -sf localhost:8080/v1/systemone -H 'Authorization: Bearer smoke-key' -H 'Content-Type: application/json' -d "$body")
+          echo "$answer" | python3 -c 'import json,sys; a=json.load(sys.stdin); assert a["model"]=="smoke-alias"; assert 0 <= a["answers"]["weapon"]["noul"] <= 1, a'
+          for auth in '' 'Authorization: Bearer wrong'; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/v1/systemone ${auth:+-H "$auth"} -H 'Content-Type: application/json' -d "$body")
+            test "$code" = 401
+          done
+          docker stop smoke
+          test "$(docker inspect -f '{{.State.ExitCode}}' smoke)" = 0
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+      # Tag the exact attested manifest by re-uploading its bytes under the
+      # version (a registry tag operation), then prove the tag resolves to it.
+      - name: Tag the verified image with its version
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          token=$(curl -sf -u "$GITHUB_ACTOR:$GH_TOKEN" "https://ghcr.io/token?service=ghcr.io&scope=repository:$REPOSITORY:pull,push" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          accept='application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json'
+          curl -sf -D headers.txt -o manifest.json -H "Authorization: Bearer $token" -H "Accept: $accept" \
+            "https://ghcr.io/v2/$REPOSITORY/manifests/$DIGEST"
+          test "sha256:$(sha256sum manifest.json | cut -d' ' -f1)" = "$DIGEST"
+          media_type=$(grep -i '^content-type:' headers.txt | tail -1 | cut -d' ' -f2 | tr -d '\r')
+          curl -sf -X PUT -H "Authorization: Bearer $token" -H "Content-Type: $media_type" \
+            --data-binary @manifest.json "https://ghcr.io/v2/$REPOSITORY/manifests/$VERSION"
+          tagged=$(curl -sfI -H "Authorization: Bearer $token" -H "Accept: $accept" \
+            "https://ghcr.io/v2/$REPOSITORY/manifests/$VERSION" | grep -i '^docker-content-digest:' | cut -d' ' -f2 | tr -d '\r')
+          test "$tagged" = "$DIGEST"
+          echo "Published $IMAGE:$VERSION = $IMAGE@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
