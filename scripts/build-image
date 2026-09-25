@@ -1,0 +1,11 @@
+#!/bin/sh
+# Build the server image under the repository build lock.
+# Usage: scripts/build-image [tag] [platform]
+set -eu
+tag=${1:-antaeus-nli-server:dev}
+platform=${2:-}
+cd "$(dirname -- "$0")/.."
+if [ -n "$platform" ]; then
+  exec scripts/with-build-lock docker build --platform "$platform" -t "$tag" .
+fi
+exec scripts/with-build-lock docker build -t "$tag" .

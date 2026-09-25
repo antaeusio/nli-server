@@ -1,0 +1,5 @@
+#!/bin/sh
+# Run the unit tests. They need only the Python standard library.
+set -eu
+cd "$(dirname -- "$0")/.."
+exec python3 -m unittest discover -s tests -t . "$@"

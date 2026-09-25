@@ -1,0 +1,7 @@
+*
+!nli_server/
+!requirements.lock
+!requirements-torch.lock
+!requirements-model.lock
+!model.sha256
+nli_server/__pycache__/

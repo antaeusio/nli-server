@@ -1,0 +1,20 @@
+#!/bin/sh
+# Regenerate the hash-pinned locks for Linux x86_64 and aarch64 on Python 3.12.
+# torch comes only from the PyTorch CPU index; everything else only from PyPI,
+# so no package can be satisfied from the other index.
+set -eu
+cd "$(dirname -- "$0")/.."
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+compile() {
+  uv pip compile "$@" --generate-hashes --universal --python-version 3.12 --no-header --quiet --refresh
+}
+# Resolve the full set once to choose versions.
+compile requirements.in --index-url https://pypi.org/simple \
+  --extra-index-url https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match \
+  --output-file "$tmp/all.txt"
+grep -E '^[A-Za-z0-9]' "$tmp/all.txt" | sed 's/ *\\$//' | grep -v '^torch==' > "$tmp/pypi.in"
+grep -E '^torch==' "$tmp/all.txt" | cut -d' ' -f1 > "$tmp/torch.in"
+python3 scripts/pypi-hashes.py "$tmp/pypi.in" requirements.lock
+compile "$tmp/torch.in" --index-url https://download.pytorch.org/whl/cpu --no-deps --no-annotate --output-file requirements-torch.lock
+compile requirements-model.in --index-url https://pypi.org/simple --output-file requirements-model.lock

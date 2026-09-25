@@ -1,0 +1,252 @@
+#!/bin/sh
+
+set -u
+
+usage() {
+  echo "usage: scripts/with-build-lock command [arg ...]" >&2
+  exit 64
+}
+
+[ "$#" -gt 0 ] || usage
+
+# A command already running under this wrapper (for example release packaging
+# that calls scripts/build) holds the lock; nested calls run directly.
+if [ "${ANTAEUS_BUILD_LOCK_HELD:-}" = 1 ]; then
+  exec "$@"
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || exit 70
+repo_root=$(CDPATH='' cd -- "$script_dir/.." && pwd) || exit 70
+tmp_dir="$repo_root/.tmp"
+lock_dir="$tmp_dir/antaeus-build.lock"
+takeover_dir="$tmp_dir/antaeus-build.lock.takeover"
+wait_seconds=${ANTAEUS_BUILD_LOCK_WAIT_SECONDS:-600}
+poll_seconds=${ANTAEUS_BUILD_LOCK_POLL_SECONDS:-5}
+# After forwarding a signal, wait this long for the command group to exit
+# before escalating to KILL. The lock is held until the group is gone.
+stop_seconds=${ANTAEUS_BUILD_LOCK_STOP_SECONDS:-30}
+
+for setting in "wait_seconds:$wait_seconds" "stop_seconds:$stop_seconds"; do
+  case "${setting#*:}" in
+    ''|*[!0-9]*)
+      echo "with-build-lock: ${setting%%:*} must be a non-negative integer" >&2
+      exit 64
+      ;;
+  esac
+done
+
+case "$poll_seconds" in
+  ''|0|*[!0-9]*)
+    echo "with-build-lock: ANTAEUS_BUILD_LOCK_POLL_SECONDS must be a positive integer" >&2
+    exit 64
+    ;;
+esac
+
+mkdir -p "$tmp_dir" || exit 73
+
+# Report whether any non-zombie process remains in a process group. Exited
+# children stay in the group as zombies until reaped, so kill -0 is not enough.
+# Invoked indirectly by the signal traps.
+# shellcheck disable=SC2329
+group_running() {
+  ps -A -o pgid= -o stat= 2>/dev/null | awk -v g="$1" '$1 == g && $2 !~ /^Z/ { found = 1 } END { exit !found }'
+}
+
+# A PID is treated as live unless ps cannot find it. Unlike kill -0, this does
+# not mistake another user's process (EPERM) for a dead owner.
+alive() {
+  ps -p "$1" >/dev/null 2>&1
+}
+
+# Invoked indirectly by the EXIT trap.
+# shellcheck disable=SC2329
+cleanup() {
+  if [ "${holding_takeover:-}" ]; then
+    rm -f "$takeover_dir/pid"
+    rmdir "$takeover_dir" 2>/dev/null || true
+  fi
+  if [ -d "$lock_dir" ] && [ -r "$lock_dir/pid" ]; then
+    lock_pid=$(sed -n '1p' "$lock_dir/pid" 2>/dev/null || true)
+    if [ "$lock_pid" = "$$" ]; then
+      rm -f "$lock_dir/pid" "$lock_dir/command_pid" "$lock_dir/session" "$lock_dir/started_at" "$lock_dir/host" "$lock_dir/command"
+      rmdir "$lock_dir" 2>/dev/null || true
+    fi
+  fi
+}
+
+# Report whether the command is still running: its whole process group when
+# it leads one, otherwise just its PID.
+# Invoked indirectly by the signal traps.
+# shellcheck disable=SC2329
+command_running() {
+  if [ "${command_group:-}" ] && group_running "$command_pid"; then
+    return 0
+  fi
+  alive "$command_pid"
+}
+
+# Send a signal to the command's process group, or to its PID without one.
+# Invoked indirectly by the signal traps.
+# shellcheck disable=SC2329
+signal_command() {
+  # Right after launch the group may not exist yet; then signal the PID.
+  if [ "${command_group:-}" ] && kill -s "$1" -- "-$command_pid" 2>/dev/null; then
+    return 0
+  fi
+  kill -s "$1" "$command_pid" 2>/dev/null || true
+}
+
+# Keep the lock until the command has stopped, escalating to KILL after
+# stop_seconds. The loop is always bounded.
+# Invoked indirectly by the signal traps.
+# shellcheck disable=SC2329
+await_stop() {
+  waited=0
+  while command_running; do
+    if [ "$waited" -ge "$stop_seconds" ]; then
+      echo "with-build-lock: command $command_pid did not stop after ${stop_seconds}s; sending KILL" >&2
+      signal_command KILL
+      sleep 1
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
+# Invoked indirectly by the signal traps.
+# shellcheck disable=SC2329
+forward_signal() {
+  signal_name=$1
+  signal_status=$2
+  trap '' HUP INT TERM
+  if [ "${command_pid:-}" ]; then
+    signal_command "$signal_name"
+    await_stop
+    wait "$command_pid" 2>/dev/null || true
+  fi
+  exit "$signal_status"
+}
+
+trap cleanup 0
+trap 'forward_signal HUP 129' HUP
+trap 'forward_signal INT 130' INT
+trap 'forward_signal TERM 143' TERM
+
+started_wait=$(date +%s)
+
+check_timeout() {
+  now=$(date +%s)
+  elapsed=$((now - started_wait))
+  if [ "$elapsed" -ge "$wait_seconds" ]; then
+    echo "with-build-lock: timed out after ${elapsed}s: $1" >&2
+    exit 75
+  fi
+}
+
+while ! mkdir "$lock_dir" 2>/dev/null; do
+  owner_pid=''
+  if [ -r "$lock_dir/pid" ]; then
+    owner_pid=$(sed -n '1p' "$lock_dir/pid" 2>/dev/null || true)
+  fi
+  case "$owner_pid" in
+    '')
+      # The owner may be between mkdir and writing its metadata. Wait; a lock
+      # that never gains metadata needs a human to inspect it.
+      check_timeout "lock has no owner metadata; inspect and remove $lock_dir only if no build is running"
+      echo "with-build-lock: lock has no owner metadata yet; waiting" >&2
+      sleep "$poll_seconds"
+      continue
+      ;;
+    *[!0-9]*)
+      echo "with-build-lock: lock has invalid owner metadata; refusing to break $lock_dir" >&2
+      exit 73
+      ;;
+  esac
+
+  if alive "$owner_pid"; then
+    check_timeout "waiting for live PID $owner_pid"
+    owner_command=$(sed -n '1p' "$lock_dir/command" 2>/dev/null || echo unknown)
+    echo "with-build-lock: waiting for live PID $owner_pid (${elapsed}s/${wait_seconds}s): $owner_command" >&2
+    sleep "$poll_seconds"
+    continue
+  fi
+
+  owner_command_pid=$(sed -n '1p' "$lock_dir/command_pid" 2>/dev/null || true)
+  case "$owner_command_pid" in
+    ''|*[!0-9]*) owner_command_pid='' ;;
+  esac
+  if [ "$owner_command_pid" ] && { alive "$owner_command_pid" || group_running "$owner_command_pid"; }; then
+    check_timeout "owner PID $owner_pid is dead but command PID $owner_command_pid is still live"
+    echo "with-build-lock: owner PID $owner_pid is dead; waiting for live command PID $owner_command_pid (${elapsed}s/${wait_seconds}s)" >&2
+    sleep "$poll_seconds"
+    continue
+  fi
+
+  # Only one waiter may remove a stale lock. Inside the takeover mutex,
+  # re-read the owner so a lock replaced since the check above is never moved.
+  if mkdir "$takeover_dir" 2>/dev/null; then
+    holding_takeover=1
+    printf '%s\n' "$$" >"$takeover_dir/pid"
+    current_pid=$(sed -n '1p' "$lock_dir/pid" 2>/dev/null || true)
+    if [ "$current_pid" = "$owner_pid" ] && ! alive "$owner_pid"; then
+      stale_dir="$tmp_dir/antaeus-build.lock.stale.$$"
+      if mv "$lock_dir" "$stale_dir" 2>/dev/null; then
+        echo "with-build-lock: removed stale lock owned by verified-dead PID $owner_pid" >&2
+        rm -rf "$stale_dir"
+      fi
+    fi
+    rm -f "$takeover_dir/pid"
+    rmdir "$takeover_dir" 2>/dev/null || true
+    holding_takeover=''
+    continue
+  fi
+
+  # Another waiter is taking over. A takeover left by a crashed waiter is not
+  # removed automatically.
+  takeover_pid=$(sed -n '1p' "$takeover_dir/pid" 2>/dev/null || true)
+  case "$takeover_pid" in
+    ''|*[!0-9]*) takeover_pid='' ;;
+  esac
+  if [ "$takeover_pid" ] && ! alive "$takeover_pid"; then
+    echo "with-build-lock: stale takeover marker from dead PID $takeover_pid; inspect and remove $takeover_dir" >&2
+    exit 73
+  fi
+  check_timeout "another waiter is removing a stale lock; inspect $takeover_dir"
+  sleep 1
+done
+
+session_id=${ANTAEUS_BUILD_SESSION_ID:-${CI_JOB_ID:-local}}
+hostname_value=$(hostname 2>/dev/null || echo unknown)
+started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+printf '%s\n' "$$" >"$lock_dir/pid"
+printf '%s\n' "$session_id" >"$lock_dir/session"
+printf '%s\n' "$started_at" >"$lock_dir/started_at"
+printf '%s\n' "$hostname_value" >"$lock_dir/host"
+printf '%s\n' "$*" >"$lock_dir/command"
+
+# Start the command in its own process group so signals reach every
+# descendant, with SIGINT and SIGQUIT restored to their defaults (shells start
+# background commands with them ignored). Shell job control is not used: dash
+# disables it without a terminal and stops itself when started in the
+# background. Perl ships with macOS and Ubuntu; without it the command runs in
+# the wrapper's group and only its PID is signalled.
+export ANTAEUS_BUILD_LOCK_HELD=1
+command_group=''
+if command -v perl >/dev/null 2>&1; then
+  perl -e '$SIG{INT} = $SIG{QUIT} = "DEFAULT"; setpgrp(0, 0) or die "setpgrp: $!\n"; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n"' -- "$@" &
+  command_pid=$!
+  command_group=1
+else
+  "$@" &
+  command_pid=$!
+fi
+printf '%s\n' "$command_pid" >"$lock_dir/command_pid"
+wait "$command_pid"
+command_status=$?
+# Do not release the lock while descendants of the command still run.
+if [ "$command_group" ] && group_running "$command_pid"; then
+  await_stop
+fi
+exit "$command_status"
